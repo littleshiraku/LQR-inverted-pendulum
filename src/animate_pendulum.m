@@ -17,15 +17,16 @@ indices = 1:frameStep:lastIdx;
 
 fig = figure('Color', 'w', 'Name', ['Animation: ', result.label], ...
     'Position', [120, 120, 900, 420]);
-axis equal;
-grid on;
-xlabel('x (m)');
-ylabel('y (m)');
-ylim([-0.4, params.L + 0.5]);
+ax = axes('Parent', fig);
+axis(ax, 'equal');
+grid(ax, 'on');
+xlabel(ax, 'x (m)');
+ylabel(ax, 'y (m)');
+ylim(ax, [-0.4, params.L + 0.5]);
 
 xMin = min(result.x(indices, 1)) - params.L - 0.5;
 xMax = max(result.x(indices, 1)) + params.L + 0.5;
-xlim([xMin, xMax]);
+xlim(ax, [xMin, xMax]);
 
 cartW = 0.6;
 cartH = 0.28;
@@ -40,25 +41,25 @@ if ~useGif
 end
 
 for idx = indices
-    cla;
-    hold on;
+    cla(ax);
+    hold(ax, 'on');
     xCart = result.x(idx, 1);
     theta = result.x(idx, 3);
     pivot = [xCart, cartH/2];
     bob = [xCart + params.L*sin(theta), cartH/2 + params.L*cos(theta)];
 
-    plot([xMin, xMax], [0, 0], 'k-', 'LineWidth', 1);
-    rectangle('Position', [xCart-cartW/2, 0, cartW, cartH], ...
+    plot(ax, [xMin, xMax], [0, 0], 'k-', 'LineWidth', 1);
+    rectangle(ax, 'Position', [xCart-cartW/2, 0, cartW, cartH], ...
         'FaceColor', [0.30, 0.45, 0.70], 'EdgeColor', 'k');
-    rectangle('Position', [xCart-cartW/3-wheelR, -wheelR, 2*wheelR, 2*wheelR], ...
+    rectangle(ax, 'Position', [xCart-cartW/3-wheelR, -wheelR, 2*wheelR, 2*wheelR], ...
         'Curvature', [1, 1], 'FaceColor', [0.1, 0.1, 0.1]);
-    rectangle('Position', [xCart+cartW/3-wheelR, -wheelR, 2*wheelR, 2*wheelR], ...
+    rectangle(ax, 'Position', [xCart+cartW/3-wheelR, -wheelR, 2*wheelR, 2*wheelR], ...
         'Curvature', [1, 1], 'FaceColor', [0.1, 0.1, 0.1]);
-    plot([pivot(1), bob(1)], [pivot(2), bob(2)], 'LineWidth', 4, 'Color', [0.85, 0.35, 0.15]);
-    plot(pivot(1), pivot(2), 'ko', 'MarkerFaceColor', 'k', 'MarkerSize', 6);
-    plot(bob(1), bob(2), 'o', 'MarkerFaceColor', [0.85, 0.15, 0.10], ...
+    plot(ax, [pivot(1), bob(1)], [pivot(2), bob(2)], 'LineWidth', 4, 'Color', [0.85, 0.35, 0.15]);
+    plot(ax, pivot(1), pivot(2), 'ko', 'MarkerFaceColor', 'k', 'MarkerSize', 6);
+    plot(ax, bob(1), bob(2), 'o', 'MarkerFaceColor', [0.85, 0.15, 0.10], ...
         'MarkerEdgeColor', 'k', 'MarkerSize', 16);
-    title(sprintf('%s, t = %.2f s', result.label, result.t(idx)), 'Interpreter', 'none');
+    title(ax, sprintf('%s, t = %.2f s', result.label, result.t(idx)), 'Interpreter', 'none');
     drawnow;
 
     frame = getframe(fig);
