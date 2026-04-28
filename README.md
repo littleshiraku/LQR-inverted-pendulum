@@ -1,3 +1,6 @@
+
+Special thanks to Lester YHZ
+
 # 一阶倒立摆 LQR 与 LoRA-LLM 控制实验
 
 本项目使用 MATLAB R2023a 复现一阶倒立摆建模、LQR 控制、开环/闭环仿真、动画生成，以及 LoRA 微调 Llama 3.2 1B 直接控制实验；不涉及 Simulink 建模。
