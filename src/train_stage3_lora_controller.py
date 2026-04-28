@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -12,6 +14,7 @@ import numpy as np
 from stage3_llm_control import (
     ALPACA_PROMPT,
     DATA_DIR,
+    LLAMA_MAX_NEW_TOKENS,
     LLAMA_MAX_SEQ_LENGTH,
     LLAMA_MODEL_ID,
     LORA_MODEL_DIR,
@@ -25,6 +28,12 @@ from stage3_llm_control import (
 DATASET_PATH = Path(os.environ.get("STAGE3_LORA_DATASET_PATH", str(DATA_DIR / "stage3_lora_dataset.jsonl")))
 TRAIN_LORA_MODEL_DIR = Path(os.environ.get("STAGE3_LORA_OUTPUT_DIR", str(LORA_MODEL_DIR)))
 TRAINING_META_PATH = TRAIN_LORA_MODEL_DIR / "stage3_lora_training_meta.json"
+BASE_MODEL_CACHE_DIR = (
+    MODEL_CACHE_DIR
+    / "hub"
+    / "models--unsloth--Llama-3.2-1B-Instruct-unsloth-bnb-4bit"
+    / "snapshots"
+)
 
 DEFAULT_NUM_SAMPLES = 60_000
 DEFAULT_EPISODE_STEPS = 30
@@ -32,6 +41,8 @@ DEFAULT_BATCH_SIZE = 8
 DEFAULT_GRAD_ACCUM = 4
 DEFAULT_EPOCHS = 1.0
 DEFAULT_LEARNING_RATE = 2e-4
+DEFAULT_U_TRAIN_MAX = 60.0
+DEFAULT_VAL_SAMPLES = 256
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -49,6 +60,17 @@ def env_float(name: str, default: float) -> float:
     return default if value is None or value == "" else float(value)
 
 
+def resolve_base_model_name() -> str:
+    configured = os.environ.get("STAGE3_BASE_MODEL_PATH")
+    if configured:
+        return configured
+    if BASE_MODEL_CACHE_DIR.exists():
+        snapshots = sorted(path for path in BASE_MODEL_CACHE_DIR.iterdir() if (path / "config.json").exists())
+        if snapshots:
+            return str(snapshots[-1])
+    return LLAMA_MODEL_ID
+
+
 def format_state(state: np.ndarray) -> str:
     return (
         f"State: [x={state[0]:.3f}, dx={state[1]:.3f}, "
@@ -56,7 +78,7 @@ def format_state(state: np.ndarray) -> str:
     )
 
 
-def generate_dataset(num_samples: int, episode_steps: int) -> dict:
+def generate_dataset(num_samples: int, episode_steps: int, u_train_max: float) -> dict:
     controller = lqr_baseline_policy()
     if controller is None:
         raise RuntimeError("SciPy is required to generate LQR expert data.")
@@ -74,7 +96,7 @@ def generate_dataset(num_samples: int, episode_steps: int) -> dict:
             state = rng.uniform(low=low, high=high)
             episodes += 1
             for _ in range(episode_steps):
-                force = float(np.clip(controller(state.copy()), -PARAMS["u_max"], PARAMS["u_max"]))
+                force = float(np.clip(controller(state.copy()), -u_train_max, u_train_max))
                 record = {
                     "instruction": "You are a specialized LQR controller. Output only one line in this exact format: Action: <continuous force in Newtons>",
                     "input": format_state(state),
@@ -95,8 +117,70 @@ def generate_dataset(num_samples: int, episode_steps: int) -> dict:
         "state_low": low.tolist(),
         "state_high": high.tolist(),
         "expert": "continuous-time LQR on project dynamics",
+        "u_train_max": u_train_max,
         "llm_sample_time": hold_steps * PARAMS["dt"],
         "llm_control_hold_steps": hold_steps,
+    }
+
+
+def parse_action(text: str) -> float | None:
+    match = re.search(r"Action:\s*(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)", text)
+    if match is None:
+        return None
+    value = float(match.group(1))
+    return value if math.isfinite(value) else None
+
+
+def validate_lora(model, tokenizer, val_samples: int, u_train_max: float) -> dict:
+    if val_samples <= 0:
+        return {"num_validation_samples": 0, "parse_failures": 0}
+
+    controller = lqr_baseline_policy()
+    if controller is None:
+        raise RuntimeError("SciPy is required to validate LQR expert data.")
+
+    import torch
+    from unsloth import FastLanguageModel
+
+    FastLanguageModel.for_inference(model)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    rng = np.random.default_rng(20260429)
+    low = np.array([-0.5, -0.8, -0.18, -1.0], dtype=float)
+    high = np.array([0.5, 0.8, 0.18, 1.0], dtype=float)
+
+    abs_errors = []
+    sq_errors = []
+    parse_failures = 0
+    for _ in range(val_samples):
+        state = rng.uniform(low=low, high=high)
+        expert = float(np.clip(controller(state.copy()), -u_train_max, u_train_max))
+        prompt = ALPACA_PROMPT.format(format_state(state))
+        inputs = tokenizer([prompt], return_tensors="pt").to(device)
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=LLAMA_MAX_NEW_TOKENS,
+            use_cache=True,
+            temperature=0.0,
+            do_sample=False,
+        )
+        text_out = tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
+        predicted = parse_action(text_out)
+        if predicted is None:
+            parse_failures += 1
+            continue
+        predicted = float(np.clip(predicted, -u_train_max, u_train_max))
+        error = predicted - expert
+        abs_errors.append(abs(error))
+        sq_errors.append(error * error)
+
+    valid = len(abs_errors)
+    return {
+        "num_validation_samples": val_samples,
+        "valid_predictions": valid,
+        "parse_failures": parse_failures,
+        "mae": float(np.mean(abs_errors)) if valid else math.inf,
+        "rmse": float(np.sqrt(np.mean(sq_errors))) if valid else math.inf,
+        "max_abs_error": float(np.max(abs_errors)) if valid else math.inf,
     }
 
 
@@ -111,9 +195,11 @@ def train_lora(dataset_meta: dict) -> dict:
     grad_accum = env_int("STAGE3_LORA_GRAD_ACCUM", DEFAULT_GRAD_ACCUM)
     epochs = env_float("STAGE3_LORA_EPOCHS", DEFAULT_EPOCHS)
     learning_rate = env_float("STAGE3_LORA_LEARNING_RATE", DEFAULT_LEARNING_RATE)
+    val_samples = env_int("STAGE3_LORA_VAL_SAMPLES", DEFAULT_VAL_SAMPLES)
+    base_model_name = resolve_base_model_name()
 
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=LLAMA_MODEL_ID,
+        model_name=base_model_name,
         max_seq_length=LLAMA_MAX_SEQ_LENGTH,
         dtype=None,
         load_in_4bit=True,
@@ -146,7 +232,7 @@ def train_lora(dataset_meta: dict) -> dict:
         return {"text": texts}
 
     dataset = load_dataset("json", data_files=str(DATASET_PATH), split="train")
-    dataset = dataset.map(formatting_prompts_func, batched=True, num_proc=1)
+    dataset = dataset.map(formatting_prompts_func, batched=True)
 
     output_dir = MODEL_CACHE_DIR / "stage3_lora_training_outputs"
     args = SFTConfig(
@@ -175,6 +261,7 @@ def train_lora(dataset_meta: dict) -> dict:
     )
 
     trainer.train()
+    validation_metrics = validate_lora(model, tokenizer, val_samples, dataset_meta["u_train_max"])
 
     TRAIN_LORA_MODEL_DIR.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(str(TRAIN_LORA_MODEL_DIR))
@@ -183,6 +270,7 @@ def train_lora(dataset_meta: dict) -> dict:
     training_meta = {
         **dataset_meta,
         "base_model_id": LLAMA_MODEL_ID,
+        "base_model_name_or_path": base_model_name,
         "lora_model_dir": str(TRAIN_LORA_MODEL_DIR),
         "max_seq_length": LLAMA_MAX_SEQ_LENGTH,
         "lora_r": 16,
@@ -192,6 +280,7 @@ def train_lora(dataset_meta: dict) -> dict:
         "num_train_epochs": epochs,
         "max_steps": max_steps,
         "learning_rate": learning_rate,
+        "validation_metrics": validation_metrics,
         "torch_cuda_available": torch.cuda.is_available(),
         "torch_cuda_device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
     }
@@ -205,9 +294,12 @@ def main() -> None:
 
     num_samples = env_int("STAGE3_LORA_NUM_SAMPLES", DEFAULT_NUM_SAMPLES)
     episode_steps = env_int("STAGE3_LORA_EPISODE_STEPS", DEFAULT_EPISODE_STEPS)
+    u_train_max = env_float("STAGE3_LORA_U_MAX", DEFAULT_U_TRAIN_MAX)
+    if not math.isfinite(u_train_max) or u_train_max <= 0 or u_train_max > PARAMS["u_max"]:
+        raise ValueError(f"STAGE3_LORA_U_MAX must be in (0, {PARAMS['u_max']}], got {u_train_max!r}")
 
-    print(f"Generating {num_samples} LQR expert samples...")
-    dataset_meta = generate_dataset(num_samples, episode_steps)
+    print(f"Generating {num_samples} LQR expert samples with u_train_max={u_train_max:.3f} N...")
+    dataset_meta = generate_dataset(num_samples, episode_steps, u_train_max)
     print(json.dumps(dataset_meta, ensure_ascii=False, indent=2))
 
     print("Training Stage 3 LoRA controller...")

@@ -1,6 +1,6 @@
-# 一阶倒立摆 LQR 与离线 LLM 控制实验
+# 一阶倒立摆 LQR 与 LoRA-LLM 控制实验
 
-本项目使用MATLAB R2023a复现一阶倒立摆建模、LQR 控制、开环/闭环仿真、动画生成、LoRA 微调 Llama 3.2 1B 直接控制和离线 Q/R 自动调参实验，但不涉及任何simlink建模。
+本项目使用MATLAB R2023a复现一阶倒立摆建模、LQR 控制、开环/闭环仿真、动画生成、LoRA 微调 Llama 3.2 1B 直接控制和离线 Q/R 自动调参实验，但不涉及任何 Simulink 建模。
 
 ## 运行环境
 
@@ -39,7 +39,7 @@ ppt.md
 summary_report.md
 ```
 
-`figures/`, `animations/`, `data/` 会由脚本自动创建。基准 LQR 使用 `Q=diag([15, 5, 180, 50])`, `R=0.15`
+`figures/`, `animations/`, `data/`, `models/` 会由脚本自动创建。基准 LQR 使用 `Q=diag([15, 5, 180, 50])`, `R=0.15`。
 
 ## 推荐运行顺序
 
@@ -56,6 +56,18 @@ run('src/stage2_lqr.m')
 ```matlab
 run('src/train_stage3_lora_controller.m')
 ```
+
+默认训练会生成 `60000` 条本项目 LQR 专家样本，动作范围裁剪为 `±60 N`，训练后在验证状态上记录 LoRA 输出相对 LQR 动作的 MAE/RMSE。可用环境变量调整训练规模和动作范围，例如：
+
+```matlab
+setenv('STAGE3_LORA_NUM_SAMPLES', '120000')
+setenv('STAGE3_LORA_EPOCHS', '2')
+setenv('STAGE3_LORA_U_MAX', '60')
+setenv('STAGE3_LORA_VAL_SAMPLES', '256')
+run('src/train_stage3_lora_controller.m')
+```
+
+训练产物保存在 `models/stage3_lora_controller/`，训练数据保存在 `data/stage3_lora_dataset.jsonl`。这两个目录均被 `.gitignore` 忽略，不会提交模型权重或数据集。
 
 然后执行阶段 3：
 
@@ -83,13 +95,17 @@ run('src/run_all.m')
 
 阶段 3 使用真实本地 LLM 推理，阶段 4 仍使用离线推荐器：
 
-- 阶段 3：先用本项目动力学和 LQR 专家控制律训练 `models/stage3_lora_controller/`，再加载该 LoRA 控制器输出 `Action: <force>`。动力学仍按 `dt=0.01 s` 积分，LLM 每 `0.1 s` 推理一次并对中间 10 个积分步保持上一控制力；控制阶段不使用启发式、LQR、零输出或解析失败兜底。
+- 阶段 3：先用本项目动力学和 LQR 专家控制律训练 `models/stage3_lora_controller/`，再加载该 LoRA 控制器输出 `Action: <force>`。动力学仍按 `dt=0.01 s` 积分，LLM 每 `0.1 s` 推理一次并对中间 10 个积分步保持上一控制力；控制力按训练元数据中的 `u_train_max` 做执行器饱和，控制阶段不使用启发式、LQR、零输出或解析失败兜底。
 - 阶段 4：目前使用 `bayesopt` 或确定性候选搜索模拟 LLM 推荐 Q/R 的过程。
+
+当前 Stage 3 的完整训练结果记录在 `models/stage3_lora_controller/stage3_lora_training_meta.json`：`60000` 条训练样本、`u_train_max=60 N`、验证集 `MAE≈8.13 N`、`RMSE≈13.74 N`、解析失败数为 `0`。该结果相比直接使用未微调底座模型更稳定，但仍不能达到 LQR 基准控制效果。
 
 ## 主要输出
 
 - `data/model_matrices.mat`：线性化 A/B、开环极点、符号验证结果
 - `data/stage*_*.mat`：各阶段实验数据
 - `data/*_log.txt`：阶段日志
+- `data/stage3_lora_dataset.jsonl`：Stage 3 LoRA 训练数据，默认不纳入 Git
+- `models/stage3_lora_controller/`：Stage 3 LoRA 控制器，默认不纳入 Git
 - `figures/*.png`：响应曲线和搜索曲线
 - `animations/*.gif`：二维动画
