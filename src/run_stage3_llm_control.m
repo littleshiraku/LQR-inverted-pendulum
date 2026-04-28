@@ -10,6 +10,7 @@ oldDir = pwd;
 cleanup = onCleanup(@() cd(oldDir));
 cd(rootDir);
 addpath(srcDir);
+setenv('PYTHONIOENCODING', 'utf-8');
 
 pythonExe = getenv('STAGE3_PYTHON');
 if isempty(pythonExe)
@@ -19,16 +20,16 @@ end
 stage3Script = fullfile(srcDir, 'stage3_llm_control.py');
 cmd = sprintf('"%s" "%s"', pythonExe, stage3Script);
 
-fprintf('Running Stage 3 Llama direct control with:\n%s\n\n', cmd);
+fprintf('Running Stage 3 LoRA Llama direct control with:\n%s\n\n', cmd);
 [status, output] = system(cmd);
 fprintf('%s\n', output);
 
 if status ~= 0
-    error('Stage 3 Llama direct control failed with exit code %d.', status);
+    error('Stage 3 LoRA Llama direct control failed with exit code %d.', status);
 end
 
 show_stage3_results(rootDir);
-disp('Stage 3 Llama direct control complete.');
+disp('Stage 3 LoRA Llama direct control complete.');
 
 function show_stage3_results(rootDir)
 params = common_params();
@@ -38,7 +39,7 @@ if ~exist(matPath, 'file')
 end
 
 data = load(matPath);
-llmResult = make_result(data.t, data.x_llm, data.u_llm, 'Llama 3.2 1B direct');
+llmResult = make_result(data.t, data.x_llm, data.u_llm, 'LoRA Llama direct');
 
 hasLqr = isfield(data, 'x_lqr') && isfield(data, 'u_lqr');
 if hasLqr
@@ -63,7 +64,7 @@ end
 
 function plot_stage3_results(llmResult, lqrResult)
 stateNames = {'x (m)', 'x_dot (m/s)', 'theta (rad)', 'theta_dot (rad/s)'};
-figure('Color', 'w', 'Name', 'Stage 3 Llama direct control', ...
+figure('Color', 'w', 'Name', 'Stage 3 LoRA Llama direct control', ...
     'Position', [100, 100, 1100, 780]);
 tiledlayout(5, 1, 'Padding', 'compact', 'TileSpacing', 'compact');
 
@@ -77,11 +78,11 @@ for i = 1:4
     grid on;
     ylabel(stateNames{i});
     if i == 1
-        title('Stage 3 Llama 3.2 1B direct control', 'Interpreter', 'none');
+        title('Stage 3 LoRA Llama direct control', 'Interpreter', 'none');
         if ~isempty(lqrResult)
-            legend({'LQR baseline', 'Llama direct'}, 'Location', 'best');
+            legend({'LQR baseline', 'LoRA Llama direct'}, 'Location', 'best');
         else
-            legend({'Llama direct'}, 'Location', 'best');
+            legend({'LoRA Llama direct'}, 'Location', 'best');
         end
     end
 end

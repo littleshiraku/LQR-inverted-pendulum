@@ -1,8 +1,8 @@
-"""Stage 3: Llama 3.2 1B direct control.
+"""Stage 3: LoRA-tuned Llama 3.2 1B direct control.
 
-The controller uses a local Unsloth 4-bit Llama model as the only source of
-continuous force commands.  If the model output cannot be parsed as an action,
-the simulation fails immediately instead of falling back to a heuristic policy.
+The controller uses a project-specific LoRA adapter trained on LQR expert data.
+If the model output cannot be parsed as an action, the simulation fails
+immediately instead of falling back to a heuristic policy.
 """
 
 from __future__ import annotations
@@ -43,6 +43,7 @@ os.environ.setdefault("HF_HOME", str(MODEL_CACHE_DIR))
 os.environ.setdefault("HF_HUB_CACHE", str(MODEL_CACHE_DIR / "hub"))
 
 LLAMA_MODEL_ID = "unsloth/Llama-3.2-1B-Instruct-unsloth-bnb-4bit"
+LORA_MODEL_DIR = Path(os.environ.get("STAGE3_LORA_PATH", str(MODEL_CACHE_DIR / "stage3_lora_controller")))
 LLAMA_MAX_SEQ_LENGTH = 128
 LLAMA_MAX_NEW_TOKENS = 16
 
@@ -115,18 +116,24 @@ def rk4_step(state: np.ndarray, force: float, dt: float) -> np.ndarray:
 
 
 class LlamaDirectPolicy:
-    """Unsloth Llama policy that maps state text directly to force text."""
+    """LoRA-tuned Unsloth Llama policy that maps state text to force text."""
 
     action_pattern = re.compile(r"Action:\s*(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")
 
     def __init__(self) -> None:
+        if not LORA_MODEL_DIR.exists():
+            raise FileNotFoundError(
+                "Stage 3 LoRA controller was not found. Train it first with: "
+                "run('src/train_stage3_lora_controller.m')"
+            )
+
         from unsloth import FastLanguageModel
         from transformers.utils import logging as transformers_logging
 
         transformers_logging.set_verbosity_error()
 
         self.model, self.tokenizer = FastLanguageModel.from_pretrained(
-            model_name=LLAMA_MODEL_ID,
+            model_name=str(LORA_MODEL_DIR),
             max_seq_length=LLAMA_MAX_SEQ_LENGTH,
             dtype=None,
             load_in_4bit=True,
@@ -260,17 +267,17 @@ def plot_results(llm_result: dict, lqr_result: dict | None) -> None:
     for i, name in enumerate(names):
         if lqr_result is not None:
             axes[i].plot(lqr_result["t"], lqr_result["x"][:, i], label="LQR baseline", color="#1f77b4")
-        axes[i].plot(llm_result["t"], llm_result["x"][:, i], label="Llama 3.2 1B direct", color="#d62728")
+        axes[i].plot(llm_result["t"], llm_result["x"][:, i], label="LoRA Llama direct", color="#d62728")
         axes[i].set_ylabel(name)
         axes[i].grid(True, alpha=0.3)
     if lqr_result is not None:
         axes[4].plot(lqr_result["t"], lqr_result["u"], label="LQR baseline", color="#1f77b4")
-    axes[4].plot(llm_result["t"], llm_result["u"], label="Llama 3.2 1B direct", color="#d62728")
+    axes[4].plot(llm_result["t"], llm_result["u"], label="LoRA Llama direct", color="#d62728")
     axes[4].set_ylabel("u (N)")
     axes[4].set_xlabel("Time (s)")
     axes[4].grid(True, alpha=0.3)
     axes[0].legend(loc="best")
-    fig.suptitle("Stage 3 Llama 3.2 1B direct control")
+    fig.suptitle("Stage 3 LoRA Llama direct control")
     fig.tight_layout()
     fig.savefig(FIG_DIR / "stage3_llm_vs_lqr.png", dpi=160)
     plt.close(fig)
@@ -307,7 +314,7 @@ def animate(result: dict) -> None:
         ax.plot([pivot[0], bob[0]], [pivot[1], bob[1]], color="#dd8452", linewidth=4)
         ax.plot(pivot[0], pivot[1], "ko", markersize=5)
         ax.plot(bob[0], bob[1], "o", color="#c44e52", mec="k", markersize=14)
-        ax.set_title(f"Llama 3.2 1B direct control, t={t[idx]:.2f}s")
+        ax.set_title(f"LoRA Llama direct control, t={t[idx]:.2f}s")
 
     writer = PillowWriter(fps=30)
     with writer.saving(fig, ANIM_DIR / "stage3_llm_control.gif", dpi=100):
@@ -376,7 +383,7 @@ def main() -> None:
     llm_sample_time = llm_hold_steps * PARAMS["dt"]
 
     llm_policy = LlamaDirectPolicy()
-    llm_result = simulate(llm_policy, x0, "Llama 3.2 1B direct", llm_hold_steps)
+    llm_result = simulate(llm_policy, x0, "LoRA Llama direct", llm_hold_steps)
     llm_metrics = metrics(llm_result)
 
     lqr_controller = lqr_baseline_policy()
@@ -392,6 +399,7 @@ def main() -> None:
         "lqr_metrics": lqr_metrics,
         "params": PARAMS,
         "llm_model_id": LLAMA_MODEL_ID,
+        "llm_lora_path": str(LORA_MODEL_DIR),
         "llm_max_seq_length": LLAMA_MAX_SEQ_LENGTH,
         "llm_max_new_tokens": LLAMA_MAX_NEW_TOKENS,
         "llm_sample_time": llm_sample_time,
@@ -425,7 +433,8 @@ def main() -> None:
         "将 Llama 3.2 1B 4-bit 指令模型作为直接策略网络，验证状态输入到连续控制力输出的闭环接口，并与阶段 2 LQR 基准对比。\n\n"
         "## 关键参数\n"
         f"- 蒙特卡罗次数：`1`\n- 随机初始角：`theta0={theta0:.5f} rad`\n"
-        f"- 模型：`{LLAMA_MODEL_ID}`\n"
+        f"- 底座模型：`{LLAMA_MODEL_ID}`\n"
+        f"- LoRA 控制器：`{LORA_MODEL_DIR}`\n"
         f"- LLM 推理采样周期：`{llm_sample_time:.3f} s`，即每 `{llm_hold_steps}` 个 `dt` 更新一次控制力，中间零阶保持。\n"
         "- 策略形式：模型直接输出 `Action: <force>`，控制阶段不使用启发式、LQR 或零输出兜底。\n\n"
         "## 结果截图/动画\n"
@@ -435,7 +444,7 @@ def main() -> None:
         f"{metric_table_md(llm_metrics)}\n"
         f"{compare_text}\n"
         "## 结论与不足\n"
-        "本阶段已接入真实 Llama 3.2 1B 4-bit 模型进行直接控制；未加载倒立摆 LoRA，因此控制性能完全取决于底座指令模型对数值动作格式的生成能力。\n"
+        "本阶段加载由本项目 LQR 专家数据训练得到的 LoRA 控制器；控制阶段仍只使用模型输出的连续力，不使用启发式或 LQR 兜底。\n"
     )
     replace_stage_section("阶段 3：LLM 直接控制", body)
     print("Stage 3 complete.")

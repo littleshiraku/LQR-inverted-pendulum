@@ -1,6 +1,6 @@
 # 一阶倒立摆 LQR 与离线 LLM 控制实验
 
-本项目使用MATLAB R2023a复现一阶倒立摆建模、LQR 控制、开环/闭环仿真、动画生成、Llama 3.2 1B 直接控制和离线 Q/R 自动调参实验，但不涉及任何simlink建模。
+本项目使用MATLAB R2023a复现一阶倒立摆建模、LQR 控制、开环/闭环仿真、动画生成、LoRA 微调 Llama 3.2 1B 直接控制和离线 Q/R 自动调参实验，但不涉及任何simlink建模。
 
 ## 运行环境
 
@@ -10,13 +10,13 @@
 - Optimization Toolbox / Statistics and Machine Learning Toolbox：可选，用于 `bayesopt`；缺少时 `stage4_tuneQ.m` 自动使用离线确定性搜索
 - Python 3.9+
 - Python 基础依赖：`numpy`, `matplotlib`, `scipy`, `pillow`
-- Stage 3 LLM 依赖：`unsloth`, `torch`, `bitsandbytes`, `transformers`
+- Stage 3 LLM/LoRA 依赖：`unsloth`, `torch`, `bitsandbytes`, `transformers`, `trl`, `datasets`
 
 Python 依赖安装：
 
 ```powershell
 python -m pip install numpy matplotlib scipy pillow
-python -m pip install unsloth torch bitsandbytes transformers
+python -m pip install unsloth torch bitsandbytes transformers trl datasets
 ```
 
 ## 目录结构
@@ -28,6 +28,8 @@ src/
   stage2_lqr.m
   stage3_llm_control.py
   run_stage3_llm_control.m
+  train_stage3_lora_controller.py
+  train_stage3_lora_controller.m
   stage4_tuneQ.m
   run_all.m
 figures/
@@ -49,7 +51,13 @@ run('src/stage1_openloop.m')
 run('src/stage2_lqr.m')
 ```
 
-然后在 MATLAB 中通过外置 Python 进程执行阶段 3：
+首次运行阶段 3 前，先在 MATLAB 中通过外置 Python 进程训练本项目 LoRA 控制器：
+
+```matlab
+run('src/train_stage3_lora_controller.m')
+```
+
+然后执行阶段 3：
 
 ```matlab
 run('src/run_stage3_llm_control.m')
@@ -75,7 +83,7 @@ run('src/run_all.m')
 
 阶段 3 使用真实本地 LLM 推理，阶段 4 仍使用离线推荐器：
 
-- 阶段 3：固定加载 `unsloth/Llama-3.2-1B-Instruct-unsloth-bnb-4bit`，由模型输出 `Action: <force>`。动力学仍按 `dt=0.01 s` 积分，LLM 每 `0.1 s` 推理一次并对中间 10 个积分步保持上一控制力；控制阶段不使用启发式、LQR、零输出或解析失败兜底。
+- 阶段 3：先用本项目动力学和 LQR 专家控制律训练 `models/stage3_lora_controller/`，再加载该 LoRA 控制器输出 `Action: <force>`。动力学仍按 `dt=0.01 s` 积分，LLM 每 `0.1 s` 推理一次并对中间 10 个积分步保持上一控制力；控制阶段不使用启发式、LQR、零输出或解析失败兜底。
 - 阶段 4：目前使用 `bayesopt` 或确定性候选搜索模拟 LLM 推荐 Q/R 的过程。
 
 ## 主要输出
