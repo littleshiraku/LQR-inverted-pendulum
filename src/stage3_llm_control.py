@@ -1,14 +1,16 @@
-"""Stage 3: offline simulated-LLM direct control.
+"""Stage 3: Llama 3.2 1B direct control.
 
-This script intentionally does not call any external model API.  It emulates a
-Qwen-like policy interface by converting the real-time state vector into a
-continuous control force through a deterministic heuristic policy.
+The controller uses a local Unsloth 4-bit Llama model as the only source of
+continuous force commands.  If the model output cannot be parsed as an action,
+the simulation fails immediately instead of falling back to a heuristic policy.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
+import re
 from pathlib import Path
 from typing import Callable
 
@@ -33,8 +35,28 @@ ROOT = Path(__file__).resolve().parents[1]
 FIG_DIR = ROOT / "figures"
 ANIM_DIR = ROOT / "animations"
 DATA_DIR = ROOT / "data"
+MODEL_CACHE_DIR = ROOT / "models"
 for folder in (FIG_DIR, ANIM_DIR, DATA_DIR):
     folder.mkdir(parents=True, exist_ok=True)
+MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("HF_HOME", str(MODEL_CACHE_DIR))
+os.environ.setdefault("HF_HUB_CACHE", str(MODEL_CACHE_DIR / "hub"))
+
+LLAMA_MODEL_ID = "unsloth/Llama-3.2-1B-Instruct-unsloth-bnb-4bit"
+LLAMA_MAX_SEQ_LENGTH = 128
+LLAMA_MAX_NEW_TOKENS = 16
+
+ALPACA_PROMPT = """Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+
+### Instruction:
+You are a specialized LQR controller. Output only one line in this exact format:
+Action: <continuous force in Newtons>
+
+### Input:
+{}
+
+### Response:
+"""
 
 
 PARAMS = {
@@ -48,11 +70,12 @@ PARAMS = {
     "theta_band": 0.01,
     "x_band": 0.02,
     "u_max": 200.0,
+    "llm_sample_time": 0.1,
 }
 
 
 def integrate(y: np.ndarray, x: np.ndarray) -> float:
-    trapz = getattr(np, "trapezoid", np.trapz)
+    trapz = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     return float(trapz(y, x))
 
 
@@ -91,17 +114,52 @@ def rk4_step(state: np.ndarray, force: float, dt: float) -> np.ndarray:
     return state + dt * (k1 + 2 * k2 + 2 * k3 + k4) / 6.0
 
 
-def offline_qwen_policy(state: np.ndarray) -> float:
-    """Emulate an LLM policy-network interface: x -> continuous force u.
+class LlamaDirectPolicy:
+    """Unsloth Llama policy that maps state text directly to force text."""
 
-    The gain vector is deliberately not the LQR gain.  It is a deterministic
-    engineering heuristic that prioritizes angle recovery, then cart centering.
-    """
+    action_pattern = re.compile(r"Action:\s*(-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)")
 
-    x, x_dot, theta, theta_dot = state
-    force = 2.0 * x + 7.0 * x_dot + 95.0 * theta + 38.0 * theta_dot
-    force += 12.0 * math.tanh(4.0 * theta)
-    return float(np.clip(force, -PARAMS["u_max"], PARAMS["u_max"]))
+    def __init__(self) -> None:
+        from unsloth import FastLanguageModel
+        from transformers.utils import logging as transformers_logging
+
+        transformers_logging.set_verbosity_error()
+
+        self.model, self.tokenizer = FastLanguageModel.from_pretrained(
+            model_name=LLAMA_MODEL_ID,
+            max_seq_length=LLAMA_MAX_SEQ_LENGTH,
+            dtype=None,
+            load_in_4bit=True,
+        )
+        FastLanguageModel.for_inference(self.model)
+
+        import torch
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def __call__(self, state: np.ndarray) -> float:
+        x, x_dot, theta, theta_dot = state
+        input_str = (
+            f"State: [x={x:.3f}, dx={x_dot:.3f}, theta={theta:.3f}, "
+            f"dtheta={theta_dot:.3f}]"
+        )
+        prompt = ALPACA_PROMPT.format(input_str)
+        inputs = self.tokenizer([prompt], return_tensors="pt").to(self.device)
+        outputs = self.model.generate(
+            **inputs,
+            max_new_tokens=LLAMA_MAX_NEW_TOKENS,
+            use_cache=True,
+            temperature=0.0,
+            do_sample=False,
+        )
+        text_out = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)[0]
+        match = self.action_pattern.search(text_out)
+        if match is None:
+            raise ValueError(f"LLM output did not contain a parseable Action line: {text_out!r}")
+        force = float(match.group(1))
+        if not math.isfinite(force):
+            raise ValueError(f"LLM action is not finite: {force!r}")
+        return force
 
 
 def lqr_baseline_policy() -> Callable[[np.ndarray], float] | None:
@@ -120,7 +178,14 @@ def lqr_baseline_policy() -> Callable[[np.ndarray], float] | None:
     return controller
 
 
-def simulate(controller: Callable[[np.ndarray], float], x0: np.ndarray, label: str) -> dict:
+def simulate(
+    controller: Callable[[np.ndarray], float],
+    x0: np.ndarray,
+    label: str,
+    control_hold_steps: int = 1,
+) -> dict:
+    if control_hold_steps < 1:
+        raise ValueError("control_hold_steps must be at least 1.")
     dt, horizon = PARAMS["dt"], PARAMS["T"]
     t = np.arange(0.0, horizon + 0.5 * dt, dt)
     states = np.zeros((t.size, 4), dtype=float)
@@ -128,8 +193,10 @@ def simulate(controller: Callable[[np.ndarray], float], x0: np.ndarray, label: s
     states[0] = x0
     failed = False
     failure_time = math.nan
+    force = float("nan")
     for i in range(t.size - 1):
-        force = controller(states[i].copy())
+        if i % control_hold_steps == 0:
+            force = controller(states[i].copy())
         forces[i] = force
         states[i + 1] = rk4_step(states[i], force, dt)
         if not np.all(np.isfinite(states[i + 1])) or abs(states[i + 1, 2]) > PARAMS["theta_fail"]:
@@ -138,7 +205,7 @@ def simulate(controller: Callable[[np.ndarray], float], x0: np.ndarray, label: s
             states[i + 2 :] = states[i + 1]
             forces[i + 1 :] = force
             break
-    forces[-1] = controller(states[-1].copy())
+    forces[-1] = force
     return {
         "label": label,
         "t": t,
@@ -146,6 +213,7 @@ def simulate(controller: Callable[[np.ndarray], float], x0: np.ndarray, label: s
         "u": forces,
         "failed": failed,
         "failure_time": failure_time,
+        "control_hold_steps": control_hold_steps,
     }
 
 
@@ -192,17 +260,17 @@ def plot_results(llm_result: dict, lqr_result: dict | None) -> None:
     for i, name in enumerate(names):
         if lqr_result is not None:
             axes[i].plot(lqr_result["t"], lqr_result["x"][:, i], label="LQR baseline", color="#1f77b4")
-        axes[i].plot(llm_result["t"], llm_result["x"][:, i], label="Offline LLM direct", color="#d62728")
+        axes[i].plot(llm_result["t"], llm_result["x"][:, i], label="Llama 3.2 1B direct", color="#d62728")
         axes[i].set_ylabel(name)
         axes[i].grid(True, alpha=0.3)
     if lqr_result is not None:
         axes[4].plot(lqr_result["t"], lqr_result["u"], label="LQR baseline", color="#1f77b4")
-    axes[4].plot(llm_result["t"], llm_result["u"], label="Offline LLM direct", color="#d62728")
+    axes[4].plot(llm_result["t"], llm_result["u"], label="Llama 3.2 1B direct", color="#d62728")
     axes[4].set_ylabel("u (N)")
     axes[4].set_xlabel("Time (s)")
     axes[4].grid(True, alpha=0.3)
     axes[0].legend(loc="best")
-    fig.suptitle("Stage 3 offline LLM direct control")
+    fig.suptitle("Stage 3 Llama 3.2 1B direct control")
     fig.tight_layout()
     fig.savefig(FIG_DIR / "stage3_llm_vs_lqr.png", dpi=160)
     plt.close(fig)
@@ -239,7 +307,7 @@ def animate(result: dict) -> None:
         ax.plot([pivot[0], bob[0]], [pivot[1], bob[1]], color="#dd8452", linewidth=4)
         ax.plot(pivot[0], pivot[1], "ko", markersize=5)
         ax.plot(bob[0], bob[1], "o", color="#c44e52", mec="k", markersize=14)
-        ax.set_title(f"Offline LLM direct control, t={t[idx]:.2f}s")
+        ax.set_title(f"Llama 3.2 1B direct control, t={t[idx]:.2f}s")
 
     writer = PillowWriter(fps=30)
     with writer.saving(fig, ANIM_DIR / "stage3_llm_control.gif", dpi=100):
@@ -304,8 +372,11 @@ def main() -> None:
     rng = np.random.default_rng(20260427)
     theta0 = float(rng.uniform(0.05, 0.15))
     x0 = np.array([0.0, 0.0, theta0, 0.0])
+    llm_hold_steps = max(1, int(round(PARAMS["llm_sample_time"] / PARAMS["dt"])))
+    llm_sample_time = llm_hold_steps * PARAMS["dt"]
 
-    llm_result = simulate(offline_qwen_policy, x0, "Offline LLM direct")
+    llm_policy = LlamaDirectPolicy()
+    llm_result = simulate(llm_policy, x0, "Llama 3.2 1B direct", llm_hold_steps)
     llm_metrics = metrics(llm_result)
 
     lqr_controller = lqr_baseline_policy()
@@ -320,6 +391,11 @@ def main() -> None:
         "llm_metrics": llm_metrics,
         "lqr_metrics": lqr_metrics,
         "params": PARAMS,
+        "llm_model_id": LLAMA_MODEL_ID,
+        "llm_max_seq_length": LLAMA_MAX_SEQ_LENGTH,
+        "llm_max_new_tokens": LLAMA_MAX_NEW_TOKENS,
+        "llm_sample_time": llm_sample_time,
+        "llm_control_hold_steps": llm_hold_steps,
     }
     (DATA_DIR / "stage3_llm_control_log.txt").write_text(
         json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
@@ -331,6 +407,8 @@ def main() -> None:
             "x_llm": llm_result["x"],
             "u_llm": llm_result["u"],
             "llm_failed": llm_result["failed"],
+            "llm_sample_time": llm_sample_time,
+            "llm_control_hold_steps": llm_hold_steps,
         }
         if lqr_result is not None:
             mat_payload.update({"x_lqr": lqr_result["x"], "u_lqr": lqr_result["u"]})
@@ -340,14 +418,16 @@ def main() -> None:
     compare_text = ""
     if lqr_metrics is not None:
         delta = 100.0 * (lqr_metrics["cost_j"] - llm_metrics["cost_j"]) / abs(lqr_metrics["cost_j"])
-        compare_text = f"\n- 相对 LQR 基准的代价变化：`{delta:.2f}%`（正值表示离线 LLM 更低）\n"
+        compare_text = f"\n- 相对 LQR 基准的代价变化：`{delta:.2f}%`（正值表示 Llama 直接控制代价更低）\n"
 
     body = (
         "## 实验目的\n"
-        "将离线模拟 LLM 作为直接策略网络，验证状态输入到连续控制力输出的闭环接口，并与阶段 2 LQR 基准对比。\n\n"
+        "将 Llama 3.2 1B 4-bit 指令模型作为直接策略网络，验证状态输入到连续控制力输出的闭环接口，并与阶段 2 LQR 基准对比。\n\n"
         "## 关键参数\n"
         f"- 蒙特卡罗次数：`1`\n- 随机初始角：`theta0={theta0:.5f} rad`\n"
-        "- 策略形式：离线确定性启发式控制器，接口等价于 `state -> u`，不调用真实 qwen API。\n\n"
+        f"- 模型：`{LLAMA_MODEL_ID}`\n"
+        f"- LLM 推理采样周期：`{llm_sample_time:.3f} s`，即每 `{llm_hold_steps}` 个 `dt` 更新一次控制力，中间零阶保持。\n"
+        "- 策略形式：模型直接输出 `Action: <force>`，控制阶段不使用启发式、LQR 或零输出兜底。\n\n"
         "## 结果截图/动画\n"
         "![stage3](figures/stage3_llm_vs_lqr.png)\n\n"
         "动画：[`animations/stage3_llm_control.gif`](animations/stage3_llm_control.gif)\n\n"
@@ -355,7 +435,7 @@ def main() -> None:
         f"{metric_table_md(llm_metrics)}\n"
         f"{compare_text}\n"
         "## 结论与不足\n"
-        "离线模拟策略可完成连续控制接口验证，但其性能依赖人工设计的启发式增益；该结果不能替代真实 qwen 在线策略评估。\n"
+        "本阶段已接入真实 Llama 3.2 1B 4-bit 模型进行直接控制；未加载倒立摆 LoRA，因此控制性能完全取决于底座指令模型对数值动作格式的生成能力。\n"
     )
     replace_stage_section("阶段 3：LLM 直接控制", body)
     print("Stage 3 complete.")
