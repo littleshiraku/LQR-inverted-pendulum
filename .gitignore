@@ -1,12 +1,19 @@
 __pycache__/
 *.py[cod]
+
 # Generated reports and media artifacts
 animations/
 figures/
 ppt.md
 summary_report.md
+LQR与LLM.pptx
 
 # Generated experiment data and local model/cache artifacts
 data/
 models/
 unsloth_compiled_cache/
+resource/
+
+# Local Python/tool caches
+.cache/
+.pytest_cache/

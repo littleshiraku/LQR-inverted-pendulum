@@ -7,8 +7,7 @@ if exist(pptPath, 'file')
 else
     oldText = sprintf(['# 阶段 1：开环验证\n\n', ...
         '# 阶段 2：LQR 闭环\n\n', ...
-        '# 阶段 3：LLM 直接控制\n\n', ...
-        '# 阶段 4：LLM 调 Q 矩阵\n']);
+        '# 阶段 3：LLM 直接控制\n']);
 end
 
 stageTitle = char(stageTitle);
